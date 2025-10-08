@@ -1,0 +1,12 @@
+data/
+# pixi environments
+.pixi
+*.egg-info
+
+# netcdf data
+*.nc
+
+# Test point csv
+*.csv
+
+.claude

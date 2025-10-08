@@ -43,7 +43,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/schmidtdse/josh-external-sources/devcontainer
+          images: ghcr.io/schmidtdse/climate_data_pipeline/devcontainer
           tags: |
             type=ref,event=branch
             type=sha,prefix={{branch}}-
@@ -63,7 +63,7 @@ jobs:
       - name: Create artifact from built image
         if: github.event_name == 'workflow_dispatch'
         run: |
-          docker save ghcr.io/schmidtdse/josh-external-sources/devcontainer:latest | gzip > devcontainer-image.tar.gz
+          docker save ghcr.io/schmidtdse/climate_data_pipeline/devcontainer:latest | gzip > devcontainer-image.tar.gz
 
       - name: Upload Docker image artifact
         if: github.event_name == 'workflow_dispatch'

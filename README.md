@@ -1,3 +1,7 @@
+### Overview
+
+This repo contains tools to query and visualize downscaled CMIP6 data from ![climakitae](https://github.com/cal-adapt/climakitae) - code and notebooks are slightly modified from the ![Berkeley Geospatial Innovation Facility](http://gif.berkeley.edu/).
+
 ### DevContainer
 
 You will need the following:

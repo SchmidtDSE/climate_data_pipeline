@@ -12,12 +12,22 @@
             "installSsh": true
         }
     },
+
+    
+    //stops VS Code from overriding  Dockerfile's CMD
+    //lets container start and run "tail -f /dev/null",
+    // then VS Code attaches to it this apparently more stable
+    "overrideCommand": false,
+    
     "customizations": {
         "vscode": {
             "extensions": [
                 "ms-python.python",
                 "ms-toolsai.jupyter@2025.7.0",
-                "ms-toolsai.datawrangler"
+                "ms-toolsai.datawrangler",
+                //R lang support
+                "REditorSupport.r",
+                "RDebugger.r-debugger"
             ]
         }
     }

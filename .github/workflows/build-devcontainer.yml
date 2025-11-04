@@ -17,7 +17,7 @@ jobs:
       packages: write
 
     steps:
-      # Free up disk space for larger images
+    # Free up disk space for larger images
       - name: Cleanup disk space
         run: |
           sudo rm -rf /usr/local/lib/android
@@ -62,8 +62,10 @@ jobs:
 
       - name: Create artifact from built image
         if: github.event_name == 'workflow_dispatch'
+        # different than before, now using metadata output rather than hardcoded tag, more robust, saved me some time.
         run: |
-          docker save ghcr.io/schmidtdse/climate_data_pipeline/devcontainer:latest | gzip > devcontainer-image.tar.gz
+          IMAGE_ID=$(echo "${{ steps.meta.outputs.tags }}" | head -n 1)
+          docker save $IMAGE_ID | gzip > devcontainer-image.tar.gz
 
       - name: Upload Docker image artifact
         if: github.event_name == 'workflow_dispatch'

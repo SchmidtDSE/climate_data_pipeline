@@ -11,7 +11,11 @@
 #
 # Prerequisites:
 #   - Docker installed
-#   - 'coiled login' already run on host machine
+#
+# First-time Coiled setup:
+#   ./docker/run_docker.sh shell
+#   coiled login                  # copy the URL it prints into your browser
+#   exit
 #
 # =============================================================================
 
@@ -33,12 +37,12 @@ DOCKER_RUN_ARGS=(
     --rm
     -v "$PROJECT_ROOT/data:/pipeline/data"
     -v "$PROJECT_ROOT/notebooks:/pipeline/notebooks"
+    -v "$PROJECT_ROOT/lib:/pipeline/lib"
 )
 
-# Mount Coiled credentials if they exist
-if [ -d "$COILED_CONFIG" ]; then
-    DOCKER_RUN_ARGS+=(-v "$COILED_CONFIG:/root/.config/dask")
-fi
+# Mount Coiled credentials (create dir if first time so coiled login works from inside container)
+mkdir -p "$COILED_CONFIG"
+DOCKER_RUN_ARGS+=(-v "$COILED_CONFIG:/root/.config/dask")
 
 # Pass GCP credentials if set
 if [ -n "$GOOGLE_APPLICATION_CREDENTIALS" ]; then

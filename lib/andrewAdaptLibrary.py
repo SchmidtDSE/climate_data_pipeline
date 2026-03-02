@@ -72,8 +72,42 @@ VARIABLE_MAP = {
     },
 }
 
+# WRF uses different variable names than LOCA2/CMIP6
+WRF_VARIABLE_MAP = {
+    "T_Max": {
+        "id": "t2max",
+        "units_raw": "K",
+        "units_final": "C",
+    },
+    "T_Min": {
+        "id": "t2min",
+        "units_raw": "K",
+        "units_final": "C",
+    },
+    "Precip": {
+        "id": "prec",
+        "units_raw": "kg/m^2/s",
+        "units_final": "mm/month",
+    },
+}
+
 # Reverse lookup: variable_id -> short name
 VARIABLE_MAP_REV = {v["id"]: k for k, v in VARIABLE_MAP.items()}
+
+
+def _get_var_id(var_key: str, activity: str = "LOCA2") -> str:
+    """Get the dataset-specific variable ID for a human-readable key.
+
+    Args:
+        var_key: Human-readable name like "T_Max", "T_Min", "Precip"
+        activity: "LOCA2" or "WRF"
+
+    Returns:
+        Variable ID string (e.g. "tasmax" for LOCA2, "t2max" for WRF)
+    """
+    if activity == "WRF":
+        return WRF_VARIABLE_MAP[var_key]["id"]
+    return VARIABLE_MAP[var_key]["id"]
 
 SCENARIO_MAP = {
     "Historical Climate": "historical",
@@ -1015,6 +1049,148 @@ def build_coiled_task(var_key: str, var_id: str, paths_list: list,
     )
 
 
+def build_wrf_coiled_task(var_key: str, var_id: str, paths_list: list,
+                          time_slice: tuple, lat_bounds: tuple,
+                          lon_bounds: tuple, boundary_wkt: list,
+                          boundary_crs: str):
+    """Create a @dask.delayed task for WRF data on a Coiled worker.
+
+    Same interface as build_coiled_task but handles WRF's curvilinear grid:
+    lat/lon are 2D coordinate arrays on (y, x) dims in Lambert Conformal
+    projection. Uses boolean masking instead of .sel().
+
+    Args:
+        var_key: Variable short name ("T_Max", "T_Min", "Precip")
+        var_id: WRF variable_id (e.g. "t2max")
+        paths_list: List of {"source_id":..., "member_id":..., "path":...}
+        time_slice: (start_year, end_year)
+        lat_bounds: (south, north)
+        lon_bounds: (west, east)
+        boundary_wkt: WKT strings from boundary_to_wkt()
+        boundary_crs: CRS string from boundary_to_wkt()
+
+    Returns:
+        dask.delayed object that computes to a pandas DataFrame
+    """
+    dask = _get_dask()
+
+    @dask.delayed
+    def _remote_process_wrf(var_key, var_id, paths_list, time_slice_start,
+                            time_slice_end, lat_bounds, lon_bounds,
+                            boundary_wkt, boundary_crs):
+        """Runs ENTIRELY on a Coiled worker in us-west-2."""
+        import xarray as xr
+        import numpy as np
+        import pandas as pd
+        import geopandas as gpd
+        import rioxarray  # noqa: F401
+        from shapely import wkt
+        import fsspec
+        import time as _time
+
+        t0 = _time.perf_counter()
+        time_sel = slice(str(time_slice_start), str(time_slice_end))
+
+        # Reconstruct boundary from WKT
+        geometries = [wkt.loads(w) for w in boundary_wkt]
+        boundary_gdf = gpd.GeoDataFrame(geometry=geometries, crs=boundary_crs)
+
+        # Open all Zarr stores
+        datasets = []
+        for info in paths_list:
+            store = fsspec.get_mapper(info["path"], anon=True)
+            ds = xr.open_zarr(store, consolidated=True)
+            da = ds[var_id]
+            da = da.sel(time=time_sel)
+
+            # WRF curvilinear grid: lat/lon are 2D coords on (y, x) dims
+            lat2d = ds.coords["lat"]
+            lon2d = ds.coords["lon"]
+
+            # Boolean mask for cells within park bounds
+            mask = (
+                (lat2d >= lat_bounds[0]) & (lat2d <= lat_bounds[1])
+                & (lon2d >= lon_bounds[0]) & (lon2d <= lon_bounds[1])
+            )
+
+            # Get bounding indices on the y, x dims to avoid loading the whole grid
+            y_any = mask.any(dim="x")
+            x_any = mask.any(dim="y")
+            y_idx = np.where(y_any.values)[0]
+            x_idx = np.where(x_any.values)[0]
+
+            if len(y_idx) == 0 or len(x_idx) == 0:
+                ds.close()
+                continue
+
+            y_sl = slice(int(y_idx[0]), int(y_idx[-1]) + 1)
+            x_sl = slice(int(x_idx[0]), int(x_idx[-1]) + 1)
+
+            da = da.isel(y=y_sl, x=x_sl)
+            sub_mask = mask.isel(y=y_sl, x=x_sl)
+            sub_lat = lat2d.isel(y=y_sl, x=x_sl)
+
+            sim_name = f"WRF_{info['source_id']}_{info['member_id']}"
+            da = da.expand_dims(simulation=[sim_name])
+            # Carry the sub-mask and sub-lat as coords for later use
+            da = da.assign_coords(_mask=sub_mask, _lat2d=sub_lat)
+            datasets.append(da)
+
+        if not datasets:
+            raise ValueError(
+                f"No WRF grid cells found within bounds "
+                f"lat={lat_bounds}, lon={lon_bounds}"
+            )
+
+        t_open = _time.perf_counter() - t0
+
+        # Concat across simulations (all share same y, x grid)
+        combined = xr.concat(datasets, dim="simulation")
+        sub_mask = combined.coords["_mask"]
+        sub_lat = combined.coords["_lat2d"]
+        combined = combined.drop_vars(["_mask", "_lat2d"])
+
+        # Unit conversion (same as LOCA2)
+        if var_key in ("T_Max", "T_Min", "T_Avg"):
+            combined = combined - 273.15
+        elif var_key == "Precip":
+            days = combined.time.dt.days_in_month
+            combined = combined * 86400 * days
+
+        # Load into memory (FAST — worker is in us-west-2 near S3)
+        t_load_start = _time.perf_counter()
+        loaded = combined.load()
+        t_load = _time.perf_counter() - t_load_start
+
+        # Apply boolean mask: NaN out cells outside park bounds
+        masked = loaded.where(sub_mask)
+
+        # Cos-weighted spatial average using 2D lat
+        weights = np.cos(np.deg2rad(sub_lat))
+        # Apply the same spatial mask to weights
+        weights = weights.where(sub_mask)
+        weights = weights / weights.sum(dim=["y", "x"])
+
+        avg = (masked * weights).sum(dim=["y", "x"], skipna=True)
+
+        t_total = _time.perf_counter() - t0
+
+        # Convert to DataFrame for transfer back
+        df = avg.to_dataframe(name=var_key).reset_index()
+        df["_open_time"] = t_open
+        df["_load_time"] = t_load
+        df["_total_time"] = t_total
+
+        return df
+
+    return _remote_process_wrf(
+        var_key, var_id, paths_list,
+        time_slice[0], time_slice[1],
+        lat_bounds, lon_bounds,
+        boundary_wkt, boundary_crs,
+    )
+
+
 # ===========================================================================
 # Section 9: High-Level API
 # ===========================================================================
@@ -1025,13 +1201,16 @@ def get_climate_data(
     boundary: gpd.GeoDataFrame,
     time_slice: tuple = DEFAULT_TIMESPAN,
     timescale: str = "monthly",
+    activity: str = "LOCA2",
+    grid: str = "d03",
     backend: str = "direct_s3",
     coiled_cluster=None,
     catalog: Optional[CatalogExplorer] = None,
 ) -> dict:
     """Fetch climate data for all variable x scenario combinations.
 
-    This is the main entry point for data retrieval.
+    This is the main entry point for data retrieval. Works with both LOCA2
+    (statistical downscaling) and WRF (dynamical downscaling) datasets.
 
     Args:
         variables: List of variable short names (e.g. ["T_Max", "T_Min", "Precip"])
@@ -1042,6 +1221,8 @@ def get_climate_data(
             - "monthly": Monthly aggregates. Temperature = mean, Precip = sum.
             - "daily": Daily values. ~30x more data than monthly.
             - "yearly": Annual max only. Only T_Max available.
+        activity: Dataset family - "LOCA2" (default) or "WRF"
+        grid: Grid resolution - "d03" (3km, default), "d02" (9km), "d01" (45km)
         backend: "direct_s3" | "climakitae" | "coiled"
         coiled_cluster: Required if backend="coiled" — a coiled.Cluster or dask Client
         catalog: Optional CatalogExplorer (created automatically if needed)
@@ -1065,7 +1246,7 @@ def get_climate_data(
     lat_bounds, lon_bounds = get_lat_lon_bounds(boundary)
 
     if catalog is None and backend in ("direct_s3", "coiled"):
-        catalog = CatalogExplorer(timescale=timescale)
+        catalog = CatalogExplorer(activity=activity, timescale=timescale, grid=grid)
     elif catalog is not None and catalog.timescale != timescale:
         # User passed a catalog but with different timescale - warn them
         import warnings
@@ -1107,12 +1288,19 @@ def get_climate_data(
         for scenario in scenarios:
             experiment = SCENARIO_MAP.get(scenario, scenario)
             for var_key in variables:
-                var_id = VARIABLE_MAP[var_key]["id"]
+                var_id = _get_var_id(var_key, activity)
                 paths = catalog.s3_paths(var_id, experiment)
-                task = build_coiled_task(
-                    var_key, var_id, paths, time_slice,
-                    lat_bounds, lon_bounds, wkt_list, crs_str,
-                )
+
+                if activity == "WRF":
+                    task = build_wrf_coiled_task(
+                        var_key, var_id, paths, time_slice,
+                        lat_bounds, lon_bounds, wkt_list, crs_str,
+                    )
+                else:
+                    task = build_coiled_task(
+                        var_key, var_id, paths, time_slice,
+                        lat_bounds, lon_bounds, wkt_list, crs_str,
+                    )
                 delayed_tasks[(var_key, scenario)] = task
 
         # Submit all at once — Dask distributes across workers
@@ -1479,3 +1667,455 @@ def anomaly_to_dataframe(anomaly_da: xr.DataArray, var_key: str,
 
     cols = [c for c in CSV_COLUMNS if c in sdf.columns]
     return sdf[cols] if len(sdf) > 0 else None
+
+
+# ===========================================================================
+# Section 9: Park Boundary Catalog
+# ===========================================================================
+
+class ParkCatalog:
+    """
+    Browse and extract individual park boundaries from the NPS lands shapefile.
+
+    The NPS shapefile contains all ~437 National Park Service units in a single
+    layer. This class lets you search by name (fuzzy matching), list what's
+    available, and extract individual park shapefiles for use with the rest
+    of the library.
+
+    Usage:
+        catalog = ParkCatalog("path/to/USA_Federal_Lands.shp")
+        catalog.list_parks()                       # see everything
+        catalog.search("yosemite")                 # fuzzy search
+        catalog.extract("Yosemite National Park")  # save to parkOutlines/
+    """
+
+    def __init__(self, shapefile_path: str):
+        self._path = shapefile_path
+        self._gdf = gpd.read_file(shapefile_path)
+        # Standardise to EPSG:4326 if needed
+        if self._gdf.crs and self._gdf.crs.to_epsg() != 4326:
+            self._gdf = self._gdf.to_crs(STANDARD_CRS)
+        self._names = sorted(self._gdf["unit_name"].unique())
+
+    def __repr__(self):
+        return f"ParkCatalog({len(self._names)} NPS units)"
+
+    def list_parks(self, filter_type: str = None) -> list:
+        """
+        List all available park/unit names.
+
+        Args:
+            filter_type: optional substring to filter by (e.g. "National Park",
+                         "National Monument", "National Preserve")
+
+        Returns:
+            Sorted list of unit name strings.
+        """
+        if filter_type:
+            return [n for n in self._names if filter_type.lower() in n.lower()]
+        return list(self._names)
+
+    def search(self, query: str, top_n: int = 5) -> list:
+        """
+        Fuzzy search for a park by name. Handles typos and partial names.
+
+        Args:
+            query: search string, e.g. "yosemite" or "josh tree"
+            top_n: number of results to return
+
+        Returns:
+            List of (unit_name, score) tuples, best matches first.
+            Score is 0-100 where 100 is a perfect match.
+        """
+        from difflib import SequenceMatcher
+
+        query_lower = query.lower()
+        scored = []
+        for name in self._names:
+            name_lower = name.lower()
+
+            # Exact substring match gets high score
+            if query_lower in name_lower:
+                score = 90 + (10 * len(query_lower) / len(name_lower))
+                scored.append((name, min(score, 100)))
+                continue
+
+            # Word-level fuzzy matching: each query word matched against
+            # each name word using SequenceMatcher (handles typos)
+            query_words = query_lower.split()
+            name_words = name_lower.split()
+            word_scores = []
+            for qw in query_words:
+                best = max(
+                    SequenceMatcher(None, qw, nw).ratio()
+                    for nw in name_words
+                )
+                word_scores.append(best)
+
+            avg_word_score = sum(word_scores) / len(word_scores)
+            if avg_word_score > 0.5:
+                score = avg_word_score * 85
+                scored.append((name, score))
+                continue
+
+            # Whole-string similarity as fallback
+            ratio = SequenceMatcher(None, query_lower, name_lower).ratio()
+            if ratio > 0.3:
+                scored.append((name, ratio * 50))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        results = scored[:top_n]
+
+        if results:
+            print(f'search: "{query}"')
+            for name, score in results:
+                marker = "  *" if score == results[0][1] else ""
+                print(f"  {score:5.1f}  {name}{marker}")
+        else:
+            print(f'no matches for "{query}"')
+
+        return results
+
+    def get_boundary(self, unit_name: str) -> gpd.GeoDataFrame:
+        """
+        Get the boundary GeoDataFrame for a park (dissolves multi-polygons).
+
+        Args:
+            unit_name: exact unit name from the catalog
+
+        Returns:
+            GeoDataFrame with a single (multi)polygon in EPSG:4326.
+        """
+        match = self._gdf[self._gdf["unit_name"] == unit_name]
+        if match.empty:
+            close = self.search(unit_name, top_n=3)
+            if close:
+                raise ValueError(
+                    f'"{unit_name}" not found. Did you mean: '
+                    f'{", ".join(c[0] for c in close)}?'
+                )
+            raise ValueError(f'"{unit_name}" not found in catalog.')
+
+        # Dissolve multi-row parks into a single boundary
+        dissolved = match.dissolve()
+        dissolved = dissolved.reset_index(drop=True)
+        return dissolved
+
+    def extract(self, unit_name: str, output_dir: str = None) -> str:
+        """
+        Extract a park boundary and save it as its own shapefile.
+
+        Args:
+            unit_name: exact unit name from the catalog
+            output_dir: base directory (default: parkOutlines/ relative to
+                        project root, auto-detected from this file's location)
+
+        Returns:
+            Path to the saved shapefile.
+        """
+        boundary = self.get_boundary(unit_name)
+
+        # Build a clean folder name: "Yosemite National Park" -> "Yosemite"
+        folder_name = (
+            unit_name
+            .replace("National Park", "")
+            .replace("National Preserve", "")
+            .replace("National Monument", "")
+            .replace("National Recreation Area", "")
+            .replace("National Historic Site", "")
+            .replace("National Historical Park", "")
+            .replace("National Seashore", "")
+            .replace("National Lakeshore", "")
+            .replace("National Memorial", "")
+            .strip()
+            .replace(" ", "")
+        )
+
+        if output_dir is None:
+            # Default to parkOutlines/ relative to lib/
+            lib_dir = os.path.dirname(os.path.abspath(__file__))
+            output_dir = os.path.join(lib_dir, "..", "parkOutlines")
+
+        park_dir = os.path.join(output_dir, folder_name)
+        os.makedirs(park_dir, exist_ok=True)
+
+        filename = unit_name.replace(" ", "_") + ".shp"
+        filepath = os.path.join(park_dir, filename)
+        boundary.to_file(filepath)
+
+        print(f"saved {filepath}")
+        print(f"  dissolved to 1 boundary, crs={boundary.crs}")
+        return filepath
+
+    # ----- Data availability ---------------------------------------------------
+
+    # LOCA2 d03 exact bounds (known from grid metadata)
+    _LOCA2_BOUNDS = {"lat": (29.58, 45.02), "lon": (-128.42, -110.98)}
+
+    # Approximate WRF domain bounds (from published domain configs).
+    # Used to decide which grids are worth probing for non-LOCA2 parks.
+    _WRF_GRIDS = {
+        "WRF_d01": {
+            "name": "WRF 45km (dynamical)", "resolution": "45 km",
+            "activity": "WRF", "grid": "d01",
+            "lat": (10.0, 65.0), "lon": (-165.0, -85.0),
+        },
+        "WRF_d02": {
+            "name": "WRF 9km (dynamical)", "resolution": "9 km",
+            "activity": "WRF", "grid": "d02",
+            "lat": (28.0, 52.0), "lon": (-130.0, -100.0),
+        },
+        "WRF_d03": {
+            "name": "WRF 3km (dynamical)", "resolution": "3 km",
+            "activity": "WRF", "grid": "d03",
+            # CA subdomain; small WY subdomain also exists
+            "lat": (32.0, 42.5), "lon": (-125.0, -114.0),
+        },
+    }
+
+    # Hardcoded catalog facts for parks inside LOCA2 d03. Based on the live
+    # catalog as of 2025. Safe to hardcode because the catalog is append-only.
+    _LOCA2_FACTS = {
+        "name": "LOCA2 3km (statistical)", "resolution": "3 km",
+        "scenarios": ["historical", "ssp245", "ssp370", "ssp585"],
+        "timescales": ["monthly", "daily", "yearly"],
+        "n_variables": 10,
+        "variables": ["tasmax", "tasmin", "pr", "hursmax", "hursmin",
+                      "huss", "rsds", "uas", "vas", "wspeed"],
+        "n_models": 15,
+    }
+    _WRF_D03_FACTS = {
+        "name": "WRF 3km (dynamical)", "resolution": "3 km",
+        "scenarios": ["historical", "reanalysis", "ssp370"],
+        "timescales": ["hourly", "daily", "monthly"],
+        "n_variables": 57, "n_models": 9,
+    }
+    _WRF_D02_FACTS = {
+        "name": "WRF 9km (dynamical)", "resolution": "9 km",
+        "scenarios": ["historical", "reanalysis", "ssp245", "ssp370", "ssp585"],
+        "timescales": ["hourly", "daily", "monthly"],
+        "n_variables": 54, "n_models": 9,
+    }
+    _WRF_D01_FACTS = {
+        "name": "WRF 45km (dynamical)", "resolution": "45 km",
+        "scenarios": ["historical", "reanalysis", "ssp245", "ssp370", "ssp585"],
+        "timescales": ["hourly", "daily", "monthly"],
+        "n_variables": 54, "n_models": 9,
+    }
+
+    def _inside_loca2(self, boundary):
+        """Check if a park boundary is fully inside the LOCA2 d03 grid."""
+        from shapely.geometry import box
+        b = self._LOCA2_BOUNDS
+        grid_geom = box(b["lon"][0], b["lat"][0], b["lon"][1], b["lat"][1])
+        return grid_geom.contains(boundary.geometry.unary_union)
+
+    def _overlaps_box(self, park_geom, lat_range, lon_range):
+        """Check if a park geometry overlaps a bounding box."""
+        from shapely.geometry import box
+        return park_geom.intersects(box(lon_range[0], lat_range[0],
+                                        lon_range[1], lat_range[1]))
+
+    def _probe_one(self, s3_path, variable_id, lat_bounds, lon_bounds):
+        """Open one Zarr store, slice to park bounds, return summary or error.
+
+        Handles two grid types:
+        - Regular grids (LOCA2): lat/lon are 1D dimension coords, use .sel()
+        - Curvilinear grids (WRF): lat/lon are 2D arrays on (y, x) dims,
+          use boolean masking to find cells within the park bounds
+        """
+        try:
+            store = fsspec.get_mapper(s3_path, anon=True)
+            ds = xr.open_zarr(store, consolidated=True)
+
+            if variable_id not in ds:
+                avail = list(ds.data_vars)[:10]
+                ds.close()
+                return {"error": f"{variable_id} not in store, has: {avail}"}
+
+            da = ds[variable_id]
+
+            # Case 1: regular grid -- lat/lon are 1D dimension coordinates
+            if "lat" in da.dims or "latitude" in da.dims:
+                lat_dim = "lat" if "lat" in da.dims else "latitude"
+                lon_dim = "lon" if "lon" in da.dims else "longitude"
+
+                sliced = da.sel(**{
+                    lat_dim: slice(lat_bounds[0], lat_bounds[1]),
+                    lon_dim: slice(lon_bounds[0], lon_bounds[1]),
+                })
+                n_spatial = sliced.sizes[lat_dim] * sliced.sizes[lon_dim]
+                n_time = sliced.sizes.get("time", 0)
+
+                if n_spatial == 0 or n_time == 0:
+                    ds.close()
+                    return {"error": "empty slice, no grid cells in park bounds"}
+
+                time_vals = sliced.time.values
+
+            # Case 2: curvilinear grid (WRF) -- lat/lon are 2D coords on (y, x)
+            elif "lat" in ds.coords and "lon" in ds.coords:
+                lat2d = ds.coords["lat"]
+                lon2d = ds.coords["lon"]
+
+                # Boolean mask: which (y, x) cells fall within the park bounds
+                mask = (
+                    (lat2d >= lat_bounds[0]) & (lat2d <= lat_bounds[1])
+                    & (lon2d >= lon_bounds[0]) & (lon2d <= lon_bounds[1])
+                )
+                n_spatial = int(mask.sum().values)
+                n_time = da.sizes.get("time", 0)
+
+                if n_spatial == 0:
+                    ds.close()
+                    return {"error": "no WRF grid cells within park bounds"}
+                if n_time == 0:
+                    ds.close()
+                    return {"error": "no timesteps"}
+
+                time_vals = da.time.values
+
+            else:
+                dims = list(da.dims)
+                coords = list(ds.coords)
+                ds.close()
+                return {"error": f"unknown grid layout, dims={dims}, coords={coords}"}
+
+            year_start = int(pd.Timestamp(time_vals[0]).year)
+            year_end = int(pd.Timestamp(time_vals[-1]).year)
+            ds.close()
+
+            return {
+                "grid_cells": n_spatial,
+                "years": f"{year_start}-{year_end}",
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def what_is_available(self, unit_name: str) -> dict:
+        """
+        Given an exact park name (from search()), show what Cal-Adapt data
+        you can actually get: which grids, scenarios, resolutions, timescales.
+
+        For parks inside the LOCA2 d03 grid (western US incl. CA, OR, WA, NV,
+        AZ, UT): returns hardcoded facts -- fast, no network needed beyond
+        the initial shapefile load.
+
+        For parks outside that grid: probes real Zarr stores on S3 using
+        tasmax (LOCA2) / t2max (WRF) to verify what data exists at the
+        park's coordinates. Tests one store per timescale per grid. Takes
+        a few seconds per grid but gives ground truth.
+
+        Args:
+            unit_name: exact unit name (use search() to find it first)
+
+        Returns:
+            dict with grid results. Each entry has name, resolution,
+            scenarios, timescales, and for probed grids the probe results
+            per timescale.
+        """
+        boundary = self.get_boundary(unit_name)
+        park_geom = boundary.geometry.unary_union
+        park_b = park_geom.bounds
+        lat_bounds, lon_bounds = get_lat_lon_bounds(boundary)
+
+        is_loca2 = self._inside_loca2(boundary)
+
+        results = {}
+
+        if is_loca2:
+            # Fast path: hardcoded facts for western US parks
+            results["LOCA2_d03"] = dict(self._LOCA2_FACTS)
+            results["WRF_d03"] = dict(self._WRF_D03_FACTS)
+            results["WRF_d02"] = dict(self._WRF_D02_FACTS)
+            results["WRF_d01"] = dict(self._WRF_D01_FACTS)
+
+        else:
+            # Slow path: probe actual stores for non-LOCA2 parks
+            raw = pd.read_csv(CATALOG_URL)
+
+            # table_id -> friendly name
+            table_names = {"mon": "monthly", "day": "daily", "1hr": "hourly"}
+
+            for gk, ginfo in self._WRF_GRIDS.items():
+                if not self._overlaps_box(park_geom, ginfo["lat"], ginfo["lon"]):
+                    continue
+
+                subset = raw[
+                    (raw.activity_id == ginfo["activity"])
+                    & (raw.grid_label == ginfo["grid"])
+                ]
+                if subset.empty:
+                    continue
+
+                # Probe with t2max, one store per timescale
+                probe_var = "t2max"
+                probe_rows = subset[subset.variable_id == probe_var]
+                if probe_rows.empty:
+                    continue
+
+                timescale_results = {}
+                for table_id, ts_name in table_names.items():
+                    ts_rows = probe_rows[probe_rows.table_id == table_id]
+                    if ts_rows.empty:
+                        timescale_results[ts_name] = None
+                        continue
+                    # Pick one store (prefer historical)
+                    for pref in ["historical", "reanalysis"]:
+                        pref_rows = ts_rows[ts_rows.experiment_id == pref]
+                        if not pref_rows.empty:
+                            ts_rows = pref_rows
+                            break
+                    path = ts_rows.iloc[0]["path"]
+                    timescale_results[ts_name] = self._probe_one(
+                        path, probe_var, lat_bounds, lon_bounds
+                    )
+
+                scenarios = sorted(subset.experiment_id.unique())
+                n_vars = subset.variable_id.nunique()
+                n_models = len(subset.source_id.dropna().unique())
+
+                results[gk] = {
+                    "name": ginfo["name"],
+                    "resolution": ginfo["resolution"],
+                    "scenarios": scenarios,
+                    "n_variables": n_vars,
+                    "n_models": n_models,
+                    "probed": timescale_results,
+                }
+
+        # Print
+        print(f"{unit_name}")
+        print(f"  lat {park_b[1]:.2f} to {park_b[3]:.2f}, "
+              f"lon {park_b[0]:.2f} to {park_b[2]:.2f}")
+
+        if not results:
+            print("  no Cal-Adapt data found for this location")
+            return results
+
+        if is_loca2:
+            print("  inside LOCA2 grid -- all western US data available\n")
+            for gk, info in results.items():
+                print(f"  {info['name']}")
+                print(f"    scenarios:  {', '.join(info['scenarios'])}")
+                print(f"    timescales: {', '.join(info['timescales'])}")
+                print(f"    variables:  {info['n_variables']}")
+                print(f"    models:     {info['n_models']}")
+        else:
+            print(f"  outside LOCA2 grid -- probed WRF stores with t2max\n")
+            for gk, info in results.items():
+                print(f"  {info['name']}")
+                for ts_name, probe in info["probed"].items():
+                    if probe is None:
+                        print(f"    {ts_name:10s} not in catalog")
+                    elif "error" in probe:
+                        print(f"    {ts_name:10s} {probe['error']}")
+                    else:
+                        print(f"    {ts_name:10s} {probe['grid_cells']} "
+                              f"grid cells, {probe['years']}")
+                print(f"    scenarios:  {', '.join(info['scenarios'])}")
+                print(f"    variables:  {info['n_variables']}")
+                print(f"    models:     {info['n_models']}")
+
+        print()
+        return results
